@@ -23,10 +23,36 @@ Line wrap the file at 100 chars.                                              Th
 
 
 ## [Unreleased]
+### Added
+- Replace repeated `Disconnecting` followed by `Connecting` notifications with a single
+  `Reconnecting` notification.
+- Allow packets to the fe80::/10 and fe02::/16 IPv6 networks when local network sharing is enabled.
+  Should allow IPv6 over the LAN, and mDNS host discovery which in turn should allow Apple AirDrop
+  and Handover.
+
+#### Linux
+- Add support for DNS configuration using resolvconf.
+
+### Changed
+- Logging in no longer requires a connection with the Mullvad API server.
+
+### Fixed
+- Don't temporarily show the unsecured state in the GUI when the app is reconnecting or blocking.
+- Periodically update list of relays in the GUI.
+- Redact IPv6 address that start or end with double colons in problem reports.
+
+
+## [2018.3] - 2018-09-17
 ### Changed
 #### macOS
 - Move the CLI binary (`mullvad`) back into the `Resources/` directory. A bug caused the app to not
   be signed if it was placed in the app root directory.
+
+### Security
+#### Windows
+- Lock the installation directory to `C:\Program Files\Mullvad VPN`. This prevents potential local
+  privilege escalation by ensuring all binaries executed by the `SYSTEM` user, as part of the
+  Mullvad system service, are stored where unprivileged users can't modify them.
 
 
 ## [2018.3-beta1] - 2018-09-13

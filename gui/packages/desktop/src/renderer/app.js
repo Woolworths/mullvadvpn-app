@@ -12,6 +12,7 @@ import {
 } from 'connected-react-router';
 import { createMemoryHistory } from 'history';
 
+import { InvalidAccountError } from './errors';
 import makeRoutes from './routes';
 import ReconnectionBackoff from './lib/reconnection-backoff';
 import { DaemonRpc, ConnectionObserver } from './lib/daemon-rpc';
@@ -33,6 +34,7 @@ import type {
   AccountToken,
   Settings,
   TunnelStateTransition,
+  RelayList,
   RelaySettingsUpdate,
   RelaySettings,
   TunnelState,
@@ -41,6 +43,8 @@ import type {
 } from './lib/daemon-rpc';
 import type { ReduxStore } from './redux/store';
 import type { TrayIconType } from '../main/tray-icon-controller';
+
+const RELAY_LIST_UPDATE_INTERVAL = 60 * 60 * 1000;
 
 export default class AppRenderer {
   _notificationController = new NotificationController();
@@ -60,6 +64,14 @@ export default class AppRenderer {
   _accountDataCache = new AccountDataCache((accountToken) => {
     return this._daemonRpc.getAccountData(accountToken);
   });
+  _relayListCache = new RelayListCache(
+    () => {
+      return this._daemonRpc.getRelayLocations();
+    },
+    (relayList) => {
+      this._updateRelayLocations(relayList);
+    },
+  );
   _tunnelStateProxy = new TunnelStateProxy(this._daemonRpc, (tunnelState) => {
     this._setTunnelState(tunnelState);
   });
@@ -106,6 +118,8 @@ export default class AppRenderer {
       }
     });
 
+    ipcRenderer.on('window-shown', () => this.updateAccountExpiry());
+
     // disable pinch to zoom
     webFrame.setVisualZoomLevelLimits(1, 1);
   }
@@ -134,10 +148,16 @@ export default class AppRenderer {
     log.debug('Logging in');
 
     try {
-      const accountData = await this._daemonRpc.getAccountData(accountToken);
+      const verification = await this.verifyAccount(accountToken);
+
       await this._daemonRpc.setAccount(accountToken);
 
-      actions.account.updateAccountExpiry(accountData.expiry);
+      if (verification.status === 'verified') {
+        actions.account.updateAccountExpiry(verification.accountData.expiry);
+      } else if (verification.status === 'deferred') {
+        log.debug(`Failed to get account data, logging in anyway: ${verification.error.message}`);
+      }
+
       actions.account.loginSuccessful();
 
       // Redirect the user after some time to allow for
@@ -158,6 +178,21 @@ export default class AppRenderer {
       log.error('Failed to log in,', error.message);
 
       actions.account.loginFailed(error);
+    }
+  }
+
+  async verifyAccount(accountToken: AccountToken): Promise<AccountVerification> {
+    try {
+      return {
+        status: 'verified',
+        accountData: await this._daemonRpc.getAccountData(accountToken),
+      };
+    } catch (error) {
+      if (error instanceof InvalidAccountError) {
+        throw error;
+      } else {
+        return { status: 'deferred', error };
+      }
     }
   }
 
@@ -275,13 +310,12 @@ export default class AppRenderer {
     actions.account.updateAccountHistory(accountHistory);
   }
 
-  async _fetchRelayLocations() {
+  _updateRelayLocations(relayList: RelayList) {
     const actions = this._reduxActions;
-    const locations = await this._daemonRpc.getRelayLocations();
 
     log.info('Got relay locations');
 
-    const storedLocations = locations.countries.map((country) => ({
+    const locations = relayList.countries.map((country) => ({
       name: country.name,
       code: country.code,
       hasActiveRelays: country.cities.some((city) => city.relays.length > 0),
@@ -295,7 +329,7 @@ export default class AppRenderer {
       })),
     }));
 
-    actions.settings.updateRelayLocations(storedLocations);
+    actions.settings.updateRelayLocations(locations);
   }
 
   async _fetchLocation() {
@@ -382,11 +416,7 @@ export default class AppRenderer {
       log.error(`Cannot fetch the current version: ${error.message}`);
     }
 
-    try {
-      await this._fetchRelayLocations();
-    } catch (error) {
-      log.error(`Cannot fetch the relay locations: ${error.message}`);
-    }
+    this._relayListCache.startUpdating();
 
     try {
       await this._fetchAccountHistory();
@@ -478,6 +508,8 @@ export default class AppRenderer {
   _onCloseConnection(error: ?Error) {
     const actions = this._reduxActions;
 
+    this._relayListCache.stopUpdating();
+
     // recover connection on error
     if (error) {
       log.debug(`Lost connection to daemon: ${error.message}`);
@@ -511,7 +543,7 @@ export default class AppRenderer {
     this._updateConnectionStatus(tunnelState);
     this._updateUserLocation(tunnelState.state);
     this._updateTrayIcon(tunnelState.state);
-    this._showNotification(tunnelState.state);
+    this._notificationController.notify(tunnelState);
   }
 
   _setSettings(newSettings: Settings) {
@@ -547,7 +579,7 @@ export default class AppRenderer {
         break;
 
       case 'disconnecting':
-        actions.connection.disconnecting();
+        actions.connection.disconnecting(stateTransition.details);
         break;
 
       case 'disconnected':
@@ -574,34 +606,16 @@ export default class AppRenderer {
 
     ipcRenderer.send('change-tray-icon', type);
   }
-
-  _showNotification(tunnelState: TunnelState) {
-    switch (tunnelState) {
-      case 'connecting':
-        this._notificationController.show('Connecting');
-        break;
-      case 'connected':
-        this._notificationController.show('Secured');
-        break;
-      case 'disconnected':
-        this._notificationController.show('Unsecured');
-        break;
-      case 'blocked':
-        this._notificationController.show('Blocked all connections');
-        break;
-      case 'disconnecting':
-        // no-op
-        break;
-      default:
-        log.error(`Unexpected TunnelState: ${(tunnelState: empty)}`);
-        return;
-    }
-  }
 }
+
+type AccountVerification =
+  | { status: 'verified', accountData: AccountData }
+  | { status: 'deferred', error: Error };
 
 // An account data cache that helps to throttle RPC requests to get_account_data and retain the
 // cached value for 1 minute.
 class AccountDataCache {
+  _currentAccount: ?AccountToken;
   _executingPromise: ?Promise<AccountData>;
   _value: ?AccountData;
   _expiresAt: ?Date;
@@ -612,6 +626,12 @@ class AccountDataCache {
   }
 
   async fetch(accountToken: AccountToken): Promise<AccountData> {
+    // invalidate cache if account token has changed
+    if (accountToken !== this._currentAccount) {
+      this.invalidate();
+      this._currentAccount = accountToken;
+    }
+
     // return the same promise if still fetching from remote
     const executingPromise = this._executingPromise;
     if (executingPromise) {
@@ -658,6 +678,37 @@ class AccountDataCache {
 
   _isExpired() {
     return !this._expiresAt || this._expiresAt < new Date();
+  }
+}
+
+class RelayListCache {
+  _fetch: () => Promise<RelayList>;
+  _listener: (RelayList) => void;
+  _updateTimer: ?IntervalID = null;
+
+  constructor(fetch: () => Promise<RelayList>, listener: (RelayList) => void) {
+    this._fetch = fetch;
+    this._listener = listener;
+  }
+
+  startUpdating() {
+    this.stopUpdating();
+    this._updateTimer = setInterval(() => this._update(), RELAY_LIST_UPDATE_INTERVAL);
+    this._update();
+  }
+
+  stopUpdating() {
+    if (this._updateTimer) {
+      clearInterval(this._updateTimer);
+    }
+  }
+
+  async _update() {
+    try {
+      this._listener(await this._fetch());
+    } catch (error) {
+      log.error(`Cannot fetch the relay locations: ${error.message}`);
+    }
   }
 }
 

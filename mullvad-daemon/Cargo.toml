@@ -1,6 +1,6 @@
 [package]
 name = "mullvad-daemon"
-version = "2018.3.0-beta1"
+version = "2018.3.0"
 authors = ["Mullvad VPN <admin@mullvad.net>", "Linus Färnstrand <linus@mullvad.net>", "Erik Larkö <erik@mullvad.net>", "Andrej Mihajlov <and@mullvad.net>"]
 description = "Mullvad VPN daemon. Runs and controls the VPN tunnels"
 license = "GPL-3.0"
@@ -44,4 +44,12 @@ windows-service = { git = "https://github.com/mullvad/windows-service-rs.git", r
 winapi = "0.3"
 
 [target.'cfg(windows)'.build-dependencies]
-windres = "0.2"
+winres = "0.1"
+winapi = "0.3"
+
+[package.metadata.winres]
+ProductName = "Mullvad VPN"
+CompanyName = "Amagicom AB"
+LegalCopyright = "(c) 2018 Amagicom AB"
+InternalName = "mullvad-daemon"
+OriginalFilename = "mullvad-daemon.exe"

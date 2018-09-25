@@ -42,15 +42,22 @@ const LocationSchema = object({
 });
 
 export type BlockReason =
-  | 'ipv6_unavailable'
-  | 'set_security_policy_error'
-  | 'start_tunnel_error'
-  | 'no_matching_relay';
+  | {
+      reason:
+        | 'ipv6_unavailable'
+        | 'set_security_policy_error'
+        | 'start_tunnel_error'
+        | 'no_matching_relay',
+    }
+  | { reason: 'auth_failed', details: ?string };
+
+export type AfterDisconnect = 'nothing' | 'block' | 'reconnect';
 
 export type TunnelState = 'connecting' | 'connected' | 'disconnecting' | 'disconnected' | 'blocked';
 
 export type TunnelStateTransition =
-  | { state: 'disconnecting' | 'disconnected' | 'connecting' | 'connected' }
+  | { state: 'disconnected' | 'connecting' | 'connected' }
+  | { state: 'disconnecting', details: AfterDisconnect }
   | { state: 'blocked', details: BlockReason };
 
 export type RelayProtocol = 'tcp' | 'udp';
@@ -229,19 +236,27 @@ const AccountDataSchema = object({
   expiry: string,
 });
 
-const allBlockReasons: Array<BlockReason> = [
-  'ipv6_unavailable',
-  'set_security_policy_error',
-  'start_tunnel_error',
-  'no_matching_relay',
-];
 const TunnelStateTransitionSchema = oneOf(
   object({
-    state: enumeration('blocked'),
-    details: enumeration(...allBlockReasons),
+    state: enumeration('disconnecting'),
+    details: enumeration('nothing', 'block', 'reconnect'),
   }),
   object({
-    state: enumeration('connected', 'connecting', 'disconnected', 'disconnecting'),
+    state: enumeration('blocked'),
+    details: oneOf(
+      object({
+        reason: enumeration(
+          'ipv6_unavailable',
+          'set_security_policy_error',
+          'start_tunnel_error',
+          'no_matching_relay',
+        ),
+      }),
+      object({ reason: enumeration('auth_failed'), details: maybe(string) }),
+    ),
+  }),
+  object({
+    state: enumeration('connected', 'connecting', 'disconnected'),
   }),
 );
 

@@ -12,8 +12,7 @@ import Img from './Img';
 import Map from './Map';
 import styles from './ConnectStyles';
 import { NoCreditError, NoInternetError } from '../errors';
-import WindowStateObserver from '../lib/window-state-observer';
-import type { BlockReason, TunnelState } from '../lib/daemon-rpc';
+import type { BlockReason, TunnelStateTransition } from '../lib/daemon-rpc';
 
 import type { HeaderBarStyle } from './HeaderBar';
 import type { ConnectionReduxState } from '../redux/connection/reducers';
@@ -27,7 +26,6 @@ type Props = {
   onConnect: () => void,
   onDisconnect: () => void,
   onExternalLink: (type: string) => void,
-  updateAccountExpiry: () => Promise<void>,
 };
 
 type State = {
@@ -39,8 +37,14 @@ type State = {
   showCopyIPMessage: boolean,
 };
 
-function getBlockReasonMessage(reason: BlockReason): string {
-  switch (reason) {
+function getBlockReasonMessage(blockReason: BlockReason): string {
+  switch (blockReason.reason) {
+    case 'auth_failed': {
+      const details =
+        blockReason.details ||
+        'Check that the account is valid, has time left and not too many connections';
+      return `Authentication failed: ${details}`;
+    }
     case 'ipv6_unavailable':
       return 'Could not configure IPv6, please enable it on your system or disable it in the app';
     case 'set_security_policy_error':
@@ -50,7 +54,7 @@ function getBlockReasonMessage(reason: BlockReason): string {
     case 'no_matching_relay':
       return 'No relay server matches the current settings';
     default:
-      return `Unknown error: ${(reason: empty)}`;
+      return `Unknown error: ${(blockReason.reason: empty)}`;
   }
 }
 
@@ -65,7 +69,6 @@ export default class Connect extends Component<Props, State> {
   };
 
   _copyTimer: ?TimeoutID;
-  _windowStateObserver = new WindowStateObserver();
 
   constructor(props: Props) {
     super();
@@ -73,15 +76,7 @@ export default class Connect extends Component<Props, State> {
     const connection = props.connection;
     this.state = {
       ...this.state,
-      banner: this.getBannerState(connection.status, connection.blockReason),
-    };
-  }
-
-  componentDidMount() {
-    this.props.updateAccountExpiry();
-
-    this._windowStateObserver.onShow = () => {
-      this.props.updateAccountExpiry();
+      banner: this.getBannerState(connection.status),
     };
   }
 
@@ -89,8 +84,6 @@ export default class Connect extends Component<Props, State> {
     if (this._copyTimer) {
       clearTimeout(this._copyTimer);
     }
-
-    this._windowStateObserver.dispose();
   }
 
   componentDidUpdate(oldProps: Props, _oldState: State) {
@@ -98,11 +91,11 @@ export default class Connect extends Component<Props, State> {
     const newConnection = this.props.connection;
 
     if (
-      oldConnection.status !== newConnection.status ||
-      oldConnection.blockReason !== newConnection.blockReason
+      oldConnection.status.state !== newConnection.status.state ||
+      oldConnection.status.details !== newConnection.status.details
     ) {
       this.setState({
-        banner: this.getBannerState(newConnection.status, newConnection.blockReason),
+        banner: this.getBannerState(newConnection.status),
       });
     }
   }
@@ -122,11 +115,8 @@ export default class Connect extends Component<Props, State> {
     );
   }
 
-  getBannerState(
-    tunnelState: TunnelState,
-    blockReason: ?BlockReason,
-  ): $PropertyType<State, 'banner'> {
-    switch (tunnelState) {
+  getBannerState(tunnelState: TunnelStateTransition): $PropertyType<State, 'banner'> {
+    switch (tunnelState.state) {
       case 'connecting':
         return {
           visible: true,
@@ -138,7 +128,7 @@ export default class Connect extends Component<Props, State> {
         return {
           visible: true,
           title: 'BLOCKING INTERNET',
-          subtitle: blockReason ? getBlockReasonMessage(blockReason) : '',
+          subtitle: getBlockReasonMessage(tunnelState.details),
         };
 
       default:
@@ -186,16 +176,17 @@ export default class Connect extends Component<Props, State> {
 
   _getMapProps() {
     const { longitude, latitude, status } = this.props.connection;
+    const state = status.state;
 
     // when the user location is known
     if (typeof longitude === 'number' && typeof latitude === 'number') {
       return {
         center: [longitude, latitude],
         // do not show the marker when connecting
-        showMarker: status !== 'connecting',
-        markerStyle: status === 'connected' || status === 'blocked' ? 'secure' : 'unsecure',
+        showMarker: state !== 'connecting',
+        markerStyle: this._getMarkerStyle(),
         // zoom in when connected
-        zoomLevel: status === 'connected' ? 'low' : 'medium',
+        zoomLevel: state === 'connected' ? 'low' : 'medium',
         // a magic offset to align marker with spinner
         offset: [0, 123],
       };
@@ -212,6 +203,31 @@ export default class Connect extends Component<Props, State> {
     }
   }
 
+  _getMarkerStyle() {
+    const { status } = this.props.connection;
+
+    switch (status.state) {
+      case 'connecting':
+      case 'connected':
+      case 'blocked':
+        return 'secure';
+      case 'disconnected':
+        return 'unsecure';
+      case 'disconnecting':
+        switch (status.details) {
+          case 'block':
+          case 'reconnect':
+            return 'secure';
+          case 'nothing':
+            return 'unsecure';
+          default:
+            throw new Error(`Invalid action after disconnection: $(status.details: empty)}`);
+        }
+      default:
+        throw new Error(`Invalid connection status: ${(status.state: empty)}`);
+    }
+  }
+
   renderMap() {
     let [isConnecting, isConnected, isDisconnected, isDisconnecting, isBlocked] = [
       false,
@@ -220,7 +236,7 @@ export default class Connect extends Component<Props, State> {
       false,
       false,
     ];
-    switch (this.props.connection.status) {
+    switch (this.props.connection.status.state) {
       case 'connecting':
         isConnecting = true;
         break;
@@ -389,32 +405,41 @@ export default class Connect extends Component<Props, State> {
 
   headerBarStyle(): HeaderBarStyle {
     const { status } = this.props.connection;
-    switch (status) {
-      case 'disconnecting':
+    switch (status.state) {
       case 'disconnected':
         return 'error';
       case 'connecting':
       case 'connected':
       case 'blocked':
         return 'success';
+      case 'disconnecting':
+        switch (status.details) {
+          case 'block':
+          case 'reconnect':
+            return 'success';
+          case 'nothing':
+            return 'error';
+          default:
+            throw new Error(`Invalid action after disconnection: ${(status.details: empty)}`);
+        }
       default:
-        throw new Error(`Invalid TunnelState: ${(status: empty)}`);
+        throw new Error(`Invalid TunnelState: ${(status.state: empty)}`);
     }
   }
 
   networkSecurityStyle(): Types.Style {
     const classes = [styles.status_security];
-    const { status } = this.props.connection;
-    if (status === 'connected' || status === 'blocked') {
+    const { state } = this.props.connection.status;
+    if (state === 'connected' || state === 'blocked') {
       classes.push(styles.status_security__secure);
-    } else if (status === 'disconnected' || status === 'disconnecting') {
+    } else if (state === 'disconnected' || state === 'disconnecting') {
       classes.push(styles.status_security__unsecured);
     }
     return classes;
   }
 
   networkSecurityMessage(): string {
-    switch (this.props.connection.status) {
+    switch (this.props.connection.status.state) {
       case 'connected':
         return 'SECURE CONNECTION';
       case 'blocked':
@@ -428,7 +453,7 @@ export default class Connect extends Component<Props, State> {
 
   ipAddressStyle(): Types.Style {
     var classes = [styles.status_ipaddress];
-    if (this.props.connection.status === 'connecting') {
+    if (this.props.connection.status.state === 'connecting') {
       classes.push(styles.status_ipaddress__invisible);
     }
     return classes;
